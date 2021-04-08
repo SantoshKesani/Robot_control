@@ -1,0 +1,327 @@
+#!/usr/bin/env python
+
+import rospy
+import math
+import sys
+import tf
+from geometry_msgs.msg import Twist, Point
+from sensor_msgs.msg import LaserScan
+from tf.transformations import euler_from_quaternion
+from rwa2_kesani import computation
+
+# Initialize your ROS node
+rospy.init_node("move_robot")
+# Set up a publisher to the /cmd_vel topic
+pub = rospy.Publisher("cmd_vel", Twist, queue_size=5)
+# Declare a message of type Twist
+velocity_msg = Twist()
+# publish the velocity at 4 Hz (4 times per second)
+rate = rospy.Rate(4)
+# set up a tf listener to retrieve transform between the robot and the world
+tf_listener = tf.TransformListener()
+# parent frame for the listener
+parent_frame = 'odom'
+# child frame for the listener
+child_frame = 'base_footprint'
+# gains for the proportional controllers. These values can be tuned.
+k_h_gain = 1
+k_v_gain = 1
+# Goal locations
+goal_locations = {0: (-2, 0), 1: (-1, 2), 2: (1, 2), 3: (2, 0), 4: (1, -1), 5: (-1, -1)}
+# Obstacle info
+obstacle_ahead = False
+obstacle_threshold = 0.25
+
+try:
+    tf_listener.waitForTransform(parent_frame, child_frame, rospy.Time(), rospy.Duration(1.0))
+except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+    rospy.loginfo("Cannot find transform between {p} and {c}".format(p=parent_frame, c=child_frame))
+    rospy.signal_shutdown("tf Exception")
+
+
+def go_straight():
+    """Move the robot in a straight line until it has driven a certain distance.
+
+    The linear velocity is modified for a Twist message and then published on /cmd_vel.
+
+    """
+
+    # get distance and linear velocity from command line
+    distance_to_drive, linear_velocity = get_distance_velocity()
+    global velocity_msg
+    # update linear.x from the command line
+    velocity_msg.linear.x = linear_velocity
+    # get the current time (s)
+    t_0 = rospy.Time.now().to_sec()
+    # keep track of the distance
+    distance_moved = 0.0
+
+    # while the amount of distance has not been reached
+    while distance_moved <= distance_to_drive:
+        rospy.loginfo("TurtleBot is moving")
+        pub.publish(velocity_msg)
+        rate.sleep()
+        # time in sec in the loop
+        t_1 = rospy.Time.now().to_sec()
+        distance_moved = (t_1 - t_0) * abs(linear_velocity)
+        rospy.loginfo("distance moved: {d}".format(d=distance_moved))
+
+    rospy.logwarn("Distance reached")
+    # finally, stop the robot when the distance is moved
+    velocity_msg.linear.x = 0.0
+    pub.publish(velocity_msg)
+
+
+def rotate():
+    """Make the robot rotate in place
+
+    The angular velocity is modified before publishing the message on the topic /cmd_vel.
+    """
+
+    # angular_velocity = math.radians(angular_velocity)
+    relative_angle_degree, angular_velocity = get_rotation()
+    velocity_msg.angular.z = angular_velocity
+
+    t0 = rospy.Time.now().to_sec()
+    while True:
+        rospy.loginfo("TurtleBot is rotating")
+        pub.publish(velocity_msg)
+        rate.sleep()
+        t1 = rospy.Time.now().to_sec()
+        rospy.loginfo("t0: {t}".format(t=t0))
+        rospy.loginfo("t1: {t}".format(t=t1))
+        current_angle_degree = (t1 - t0) * angular_velocity
+
+        rospy.loginfo("current angle: {a}".format(a=current_angle_degree))
+        rospy.loginfo("angle to reach: {a}".format(a=relative_angle_degree))
+        if abs(current_angle_degree) >= math.radians(abs(relative_angle_degree)):
+            rospy.loginfo("reached")
+            break
+    # finally, stop the robot when the distance is moved
+    velocity_msg.angular.z = 0
+    pub.publish(velocity_msg)
+
+
+def get_odom_data():
+    """Get the current pose of the robot from the /odom topic
+
+    Return
+    ----------
+    The position (x, y, z) and the yaw of the robot.
+
+    """
+    try:
+        (trans, rot) = tf_listener.lookupTransform(parent_frame, child_frame, rospy.Time(0))
+        # rotation is a list [r, p, y]
+        rotation = euler_from_quaternion(rot)
+    except (tf.Exception, tf.ConnectivityException, tf.LookupException):
+        rospy.loginfo("TF Exception")
+        return
+    # return the position (x, y, z) and the yaw
+    return Point(*trans), rotation[2]
+
+
+def get_goal():
+    """Get goal arguments from the command line
+
+    The first argument is the x coordinate.
+    The second argument is the y coordinate.
+
+    Return
+    ----------
+    The goal (x, y) to reach.
+    """
+
+    x = 0
+    y = 0
+    goal = 0
+
+    global goal_locations
+
+    if len(sys.argv) == 2:
+        goal = int(sys.argv[1])
+        x = goal_locations[goal][0]
+        y = goal_locations[goal][1]
+    else:
+        sys.exit('Not enough arguments')
+    return x, y
+
+
+def get_rotation():
+    """Retrieve rotation arguments from the command line
+
+    The first argument to retrieve is the angle (deg) to rotate.
+    The second argument is the velocity at which to rotate.
+
+    Return
+    ----------
+    The angle (deg) and the z angular velocity.
+    """
+    angle = 0
+    vel = 0
+    if len(sys.argv) == 4:
+        angle = float(sys.argv[1])
+        vel = float(sys.argv[2])
+    else:
+        sys.exit('Not enough arguments')
+    return angle, vel
+
+
+def get_distance_velocity():
+    """Get distance and velocity arguments from the command line.
+
+    The first argument to retrieve is the distance (m) to drive.
+    The second argument is the velocity of the robot.
+
+    Return
+    ----------
+    The distance (m)  and the velocity.
+    """
+    distance = 0
+    vel = 0
+    if len(sys.argv) == 4:
+        distance = float(sys.argv[1])
+        vel = float(sys.argv[2])
+    else:
+        sys.exit('Not enough arguments')
+    return distance, vel
+
+
+def go_to_goal():
+    """Task the robot to reach a goal (x,y) using a proportional controller.
+
+    The current pose of the robot is retrieved from /odom topic.
+    Publish the message to /cmd_vel topic.
+
+
+    """
+
+    # get current pose of the robot from the /odom topic
+    (position, rotation) = get_odom_data()
+    last_rotation = 0
+    # get the goal to reach from arguments passed to the command line
+    goal_x, goal_y = get_goal()
+    # compute the distance from the current position to the goal
+    distance_to_goal = computation.compute_distance(position.x, position.y, goal_x, goal_y)
+
+    while distance_to_goal > 0.05:
+        if not obstacle_ahead:
+            (position, rotation) = get_odom_data()
+            x_start = position.x
+            y_start = position.y
+            rospy.loginfo("x = {0}, y = {1}".format(x_start, y_start))
+            angle_to_goal = math.atan2(goal_y - y_start, goal_x - x_start)
+
+            # the domain of arctan(x) is (-inf, inf)
+            # we would like to restrict the domain to (0, 2pi)
+            if angle_to_goal < -math.pi/4 or angle_to_goal > math.pi/4:
+                if 0 > goal_y > y_start:
+                    angle_to_goal = -2 * math.pi + angle_to_goal
+                elif 0 <= goal_y < y_start:
+                    angle_to_goal = 2 * math.pi + angle_to_goal
+            if last_rotation > math.pi - 0.1 and rotation <= 0:
+                rotation = 2 * math.pi + rotation
+            elif last_rotation < -math.pi + 0.1 and rotation > 0:
+                rotation = -2 * math.pi + rotation
+
+            # proportional control for rotating the robot
+            velocity_msg.angular.z = k_v_gain * angle_to_goal-rotation
+            distance_to_goal = computation.compute_distance(position.x, position.y, goal_x, goal_y)
+            # proportional control to move the robot forward
+            # We will drive the robot at a maximum speed of 0.5
+            velocity_msg.linear.x = min(k_h_gain * distance_to_goal, 0.5)
+
+            # set the z angular velocity for positive and negative rotations
+            if velocity_msg.angular.z > 0:
+                velocity_msg.angular.z = min(velocity_msg.angular.z, 1.5)
+            else:
+                velocity_msg.angular.z = max(velocity_msg.angular.z, -1.5)
+
+            # update the new rotation for the next loop
+            last_rotation = rotation
+            pub.publish(velocity_msg)
+            rate.sleep()
+        else:
+            pass
+
+    # force the robot to stop by setting linear and angular velocities to 0
+    velocity_msg.linear.x = 0.0
+    velocity_msg.angular.z = 0.0
+    # publish the new message on /cmd_vel topic
+    pub.publish(velocity_msg)
+
+
+def sensor_callback(msg):
+    """Callback function to deal with messages on the /scan topic
+
+    """
+
+    front = msg.ranges[0]
+    fl = msg.ranges[45]  # Front-left
+    left = msg.ranges[90]
+    right = msg.ranges[270]
+    fr = msg.ranges[315]  # Front right
+
+    rospy.loginfo("Distance from obstacle (front): {f}".format(f=front))
+    rospy.loginfo("Distance from obstacle (left): {l}".format(l=left))
+    rospy.loginfo("Distance from obstacle (right): {r}".format(r=right))
+    rospy.loginfo("--" * 20)
+
+    global obstacle_ahead, obstacle_threshold
+
+    if (front <= obstacle_threshold or fl <= obstacle_ahead or
+            left <= obstacle_threshold or right <= obstacle_threshold or
+            fr <= obstacle_threshold):
+        obstacle_ahead = True
+
+
+def read_scan():
+    """Set up a subscriber for the scan topic
+
+    """
+    rospy.Subscriber("scan", LaserScan, sensor_callback)
+    rospy.spin()
+
+
+# Run the following is this file is called from the package bot_controller
+# rosrun bot_controller my_bot_controller <arguments>
+if __name__ == "__main__":
+    action = 0
+    action_list = [0, 1, 2, 3, 4, 5]
+    update_actions = []
+    # if len(sys.argv) == 4:
+    #     action = str(sys.argv[3])
+    # elif len(sys.argv) == 2:
+    #     action = str(sys.argv[1])
+    # else:
+    #     sys.exit('Not enough arguments passed to the command line')
+    #
+    # if action == "straight":
+    #     go_straight()
+    # elif action == "rotate":
+    #     rotate()
+    # elif action == "goal":
+    #     while not rospy.is_shutdown():
+    #         go_to_goal()
+    # elif action == "scan":
+    #     read_scan()
+    # else:
+    #     sys.exit('Unknown argument')
+
+    if len(sys.argv) == 2:
+        action = int(sys.arv[2])
+    elif len(sys.argv) == 1:
+        sys.exit('Insufficient arguments passed to the command line')
+    elif len(sys.argv) > 2:
+        sys.exit('More arguments passed to the command line')
+
+    if action in action_list:
+        if action not in update_actions:
+            while not rospy.is_shutdown():
+                go_to_goal()
+
+            update_actions.append(action)
+        else:
+            print("Action already used")
+    else:
+        print("Action out of range, enter actions in [0,5]")
